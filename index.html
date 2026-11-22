@@ -116,6 +116,8 @@ textarea{width:100%;min-height:140px;border:1px solid var(--line);border-radius:
 .manage input{width:100%;min-width:0;border:0;border-bottom:1px dashed var(--line);background:transparent;padding:4px 0;font-weight:500}
 .note{font-size:.84rem;color:var(--muted);margin:0}
 .confirm{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:.86rem}
+.cloud input{height:44px;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);min-width:0}
+.cloud form{display:flex;flex-direction:column;gap:8px}
 
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:6;background:var(--surface);border-top:1px solid var(--line);display:flex;justify-content:center;padding-bottom:env(safe-area-inset-bottom,0px);padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px)}
 nav.tabs .in{display:grid;grid-template-columns:repeat(3,1fr);width:100%;max-width:640px}
@@ -427,13 +429,94 @@ function importText(text) {
   return `Imported ${added} entr${added === 1 ? "y" : "ies"}${newB ? ` and ${newB} new behavior${newB === 1 ? "" : "s"}` : ""}. Days already logged were skipped.`;
 }
 
+// ---------- cloud backup (Supabase) ----------
+// The phone stays the main copy. A signed-in device sends a full JSON snapshot to the
+// backups table; row-level security lets each person read and write only their own rows.
+const CLOUD_URL = "https://kdgxfsgadgygvlhzvfvm.supabase.co";
+const CLOUD_KEY = "sb_publishable_IoCocxPWVBUyW8W9gMePiw_1A5XHh8h"; // public by design
+const CLOUD_STORE = KEY + "-cloud";
+const AUTO_EVERY = 60 * 60 * 1000; // at most one automatic backup an hour, and only after changes
+let cloud = { session: null, last: null, lastSig: null };
+try { Object.assign(cloud, JSON.parse(localStorage.getItem(CLOUD_STORE) || "{}")); } catch (e) {}
+let cloudBusy = false, cloudMsg = "", authMode = "in";
+const saveCloud = () => { try { localStorage.setItem(CLOUD_STORE, JSON.stringify(cloud)); } catch (e) {} };
+const dataSig = () => state.behaviors.length + ":" + state.entries.length + ":" + JSON.stringify(state).length;
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ apikey: CLOUD_KEY, "Content-Type": "application/json" }, opts.headers || {});
+  const res = await fetch(CLOUD_URL + path, Object.assign({}, opts, { headers }));
+  const text = await res.text(); let body = null; try { body = text ? JSON.parse(text) : null; } catch (e) {}
+  if (!res.ok) { const err = new Error((body && (body.msg || body.error_description || body.message)) || `The cloud said ${res.status}.`); err.status = res.status; throw err; }
+  return body;
+}
+function keepSession(b) { cloud.session = { access: b.access_token, refresh: b.refresh_token, exp: Date.now() + (b.expires_in || 3600) * 1000, email: b.user && b.user.email }; saveCloud(); }
+async function token() {
+  if (!cloud.session) throw new Error("Sign in first.");
+  if (Date.now() > cloud.session.exp - 60000) {
+    try { keepSession(await api("/auth/v1/token?grant_type=refresh_token", { method: "POST", body: JSON.stringify({ refresh_token: cloud.session.refresh }) })); }
+    catch (e) { if (e.status === 400 || e.status === 401) { cloud.session = null; saveCloud(); throw new Error("Your sign-in expired. Please sign in again."); } throw e; }
+  }
+  return cloud.session.access;
+}
+async function signIn(email, password, create) {
+  if (create) {
+    const b = await api("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email, password }) });
+    if (!b || !b.access_token) return "Check your email and tap the confirmation link. Then come back here and sign in.";
+    keepSession(b); return "Account created and signed in.";
+  }
+  keepSession(await api("/auth/v1/token?grant_type=password", { method: "POST", body: JSON.stringify({ email, password }) }));
+  return "Signed in.";
+}
+async function backupNow() {
+  const t = await token();
+  await api("/rest/v1/backups", { method: "POST", headers: { Authorization: "Bearer " + t, Prefer: "return=minimal" },
+    body: JSON.stringify({ device: navigator.userAgent.slice(0, 120), app_version: 1, behavior_count: state.behaviors.length, entry_count: state.entries.length, payload: JSON.parse(toJSON()) }) });
+  cloud.last = new Date().toISOString(); cloud.lastSig = dataSig(); saveCloud();
+}
+async function restoreLatest() {
+  const t = await token();
+  const rows = await api("/rest/v1/backups?select=payload,created_at&order=created_at.desc&limit=1", { headers: { Authorization: "Bearer " + t } });
+  if (!rows || !rows.length) throw new Error("There's no cloud backup yet.");
+  return importText(JSON.stringify(rows[0].payload));
+}
+async function cloudRun(job) {
+  if (cloudBusy) return; cloudBusy = true; cloudMsg = ""; if (tab === "data") render();
+  try { cloudMsg = await job(); } catch (e) { cloudMsg = navigator.onLine === false || e instanceof TypeError ? "No connection right now. Your data is safe on this device; try again on Wi-Fi." : e.message; }
+  cloudBusy = false; if (tab === "data") render();
+}
+function autoBackup() {
+  if (!cloud.session || state.example || cloudBusy || navigator.onLine === false) return;
+  if (cloud.lastSig === dataSig()) return;
+  if (cloud.last && Date.now() - Date.parse(cloud.last) < AUTO_EVERY) return;
+  cloudRun(async () => { await backupNow(); return "Backed up automatically."; });
+}
+const ago = iso => { const m = Math.round((Date.now() - Date.parse(iso)) / 60000); return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`; };
+function cloudCard() {
+  const s = cloud.session;
+  if (!s) return `<div class="card cloud"><h2>Cloud backup</h2>
+    <p class="note">Sign in to keep a copy of your data online. Your phone stays the main copy, and the app works offline as always.</p>
+    <form id="authForm"><input id="authEmail" type="email" autocomplete="email" placeholder="Email" aria-label="Email" required>
+      <input id="authPass" type="password" autocomplete="${authMode === "up" ? "new-password" : "current-password"}" placeholder="Password${authMode === "up" ? " (8+ characters)" : ""}" aria-label="Password" minlength="${authMode === "up" ? 8 : 1}" required>
+      <div class="btns"><button class="btn primary" type="submit"${cloudBusy ? " disabled" : ""}>${authMode === "up" ? "Create account" : "Sign in"}</button>
+      <button class="btn sm" type="button" id="authMode">${authMode === "up" ? "I have an account" : "New here? Create account"}</button></div></form>
+    ${cloudMsg ? `<p class="note">${esc(cloudMsg)}</p>` : ""}</div>`;
+  const pending = cloud.lastSig !== dataSig();
+  return `<div class="card cloud"><h2>Cloud backup</h2>
+    <p class="note">Signed in as ${esc(s.email || "you")}. ${cloud.last ? `Last backup ${ago(cloud.last)}${pending ? ", with newer changes on this phone" : ", up to date"}.` : "No backup yet."}</p>
+    <div class="btns"><button class="btn primary" id="cloudBackup"${cloudBusy ? " disabled" : ""}>${cloudBusy ? "Working…" : "Back up now"}</button>
+      <button class="btn" id="cloudRestore"${cloudBusy ? " disabled" : ""}>Restore latest</button></div>
+    <p class="note">It also backs up by itself when you open the app online after making changes, at most once an hour. Restore merges the latest backup into this phone; nothing here is overwritten.</p>
+    ${cloudMsg ? `<p class="note">${esc(cloudMsg)}</p>` : ""}
+    <div><button class="btn sm" id="cloudOut">Sign out</button></div></div>`;
+}
+
 let exportKind = null;
 function renderData() {
   const all = state.behaviors;
   const first = state.entries.reduce((m, e) => e.d < m ? e.d : m, "9999");
-  $("#v-data").innerHTML = `
+  $("#v-data").innerHTML = cloudCard() + `
     <div class="card"><h2>Your raw data</h2>
-      <p class="note">${state.entries.length} entries across ${all.length} behaviors${state.entries.length ? `, from ${fmtDay(first)}` : ""}. Everything lives on this device, nothing is sent anywhere.</p>
+      <p class="note">${state.entries.length} entries across ${all.length} behaviors${state.entries.length ? `, from ${fmtDay(first)}` : ""}. Everything lives on this device. Nothing leaves it unless you turn on cloud backup.</p>
       <div class="btns"><button class="btn" data-export="csv">Export CSV</button><button class="btn" data-export="json">Export JSON backup</button></div>
       ${exportKind ? `<textarea id="exportBox" readonly aria-label="Export">${esc(exportKind === "csv" ? toCSV() : toJSON())}</textarea>
       <div class="btns"><button class="btn sm primary" id="copyExport">Copy</button><button class="btn sm" id="dlExport">Download file</button></div>
@@ -491,10 +574,15 @@ document.addEventListener("click", async ev => {
     case "dlExport": { const stamp = todayKey(); exportKind === "csv" ? download(`tally-${stamp}.csv`, toCSV(), "text/csv") : download(`tally-backup-${stamp}.json`, toJSON(), "application/json"); break; }
     case "importBtn": try { toast(importText($("#importBox").value)); render(); } catch (e) { toast(e.message.startsWith("Unexpected") ? "That JSON couldn't be read. Check it's a complete export." : e.message); } break;
     case "wipe": pendingConfirm = "wipe"; render(); break;
+    case "authMode": authMode = authMode === "up" ? "in" : "up"; cloudMsg = ""; render(); break;
+    case "cloudBackup": cloudRun(async () => { await backupNow(); return "Backed up. 🎉"; }); break;
+    case "cloudRestore": cloudRun(restoreLatest); break;
+    case "cloudOut": cloud = { session: null, last: null, lastSig: null }; saveCloud(); cloudMsg = "Signed out. Your data is still on this phone."; render(); break;
     case "wipeYes": state = { v: 1, example: false, behaviors: [], entries: [] }; pendingConfirm = null; reindex(); save(); render(); toast("All data erased"); break;
   }
 });
 document.addEventListener("submit", ev => {
+  if (ev.target.id === "authForm") { ev.preventDefault(); const email = $("#authEmail").value.trim(), pass = $("#authPass").value; cloudRun(async () => { const m = await signIn(email, pass, authMode === "up"); if (cloud.session) { authMode = "in"; autoBackup(); } return m; }); return; }
   if (ev.target.id !== "addForm") return; ev.preventDefault();
   const name = $("#newName").value.trim(); if (!name) return;
   if (state.example) { state = { v: 1, example: false, behaviors: [], entries: [] }; reindex(); toast("Example data cleared"); }
@@ -509,9 +597,10 @@ document.addEventListener("change", ev => {
 });
 // roll over to the new day if the app stays open past midnight
 let lastToday = todayKey();
-document.addEventListener("visibilitychange", () => { if (!document.hidden && todayKey() !== lastToday) { if (day === lastToday) day = todayKey(); lastToday = todayKey(); render(); } });
+document.addEventListener("visibilitychange", () => { if (document.hidden) return; if (todayKey() !== lastToday) { if (day === lastToday) day = todayKey(); lastToday = todayKey(); render(); } autoBackup(); });
+addEventListener("online", autoBackup);
 
-save(); render();
+save(); render(); autoBackup();
 })();
 </script>
 
