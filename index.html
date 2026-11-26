@@ -477,6 +477,8 @@ async function restoreLatest() {
   const t = await token();
   const rows = await api("/rest/v1/backups?select=payload,created_at&order=created_at.desc&limit=1", { headers: { Authorization: "Bearer " + t } });
   if (!rows || !rows.length) throw new Error("There's no cloud backup yet.");
+  // on a new device the sample data is showing: replace it rather than mixing it in
+  if (state.example) { state = { v: 1, example: false, behaviors: [], entries: [] }; reindex(); }
   return importText(JSON.stringify(rows[0].payload));
 }
 async function cloudRun(job) {
@@ -486,6 +488,7 @@ async function cloudRun(job) {
 }
 function autoBackup() {
   if (!cloud.session || state.example || cloudBusy || navigator.onLine === false) return;
+  if (!state.behaviors.length && !state.entries.length) return; // never let an empty device become the latest backup
   if (cloud.lastSig === dataSig()) return;
   if (cloud.last && Date.now() - Date.parse(cloud.last) < AUTO_EVERY) return;
   cloudRun(async () => { await backupNow(); return "Backed up automatically."; });
